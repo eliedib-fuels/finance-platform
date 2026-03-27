@@ -1,0 +1,20 @@
+# Sensitive config
+scripts/config.py
+
+# Data files — keep out of git
+data/*.xlsx
+data/*.csv
+data/*.db
+data/*.log
+data/~$*
+
+# Temp Excel files
+~$*
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
