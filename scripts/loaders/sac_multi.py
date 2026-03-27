@@ -222,15 +222,19 @@ def parse_sheet(file_path: str, sheet: str,
         if org_val in ('nan', '', 'None'):
             continue
 
-        # Parse org → bu_code, suffix, entity
-        org_parts = org_val.split(' ')
-        bu_raw    = org_parts[0]
-        if not re.match(r'^0\d{6}[CS]', bu_raw):
+        # Match standard 7-digit BUs AND alphanumeric lease BUs
+        # e.g. 0577009C, 0577OPTC, 0577H61C, 0577BEAC
+        bu_match = re.match(r'^(\d{4}[A-Z0-9]{3}[CS])', org_val)
+        if not bu_match:
             continue
 
+        bu_raw  = bu_match.group(1)
         suffix  = bu_raw[-1]
         bu_code = bu_raw[:-1]
         entity  = bu_code[:4]
+
+        if bu_code[:4] == '1033':
+            log.info(f"DEBUG 1033: bu_raw={bu_raw} suffix={suffix} entity={entity} cfg={ENTITY_SUFFIX.get(entity)}")
 
         # Check valid suffix for entity
         expected_suffix = ENTITY_SUFFIX.get(entity)
@@ -293,9 +297,16 @@ def apply_fx(df: pd.DataFrame) -> pd.DataFrame:
     df['amount_usd'] = 0.0
     df['amount_eur'] = 0.0
 
+    # Hardcoded fallback rates for currencies not in budget_rates table
+    HARDCODED = {
+        'GYD': {'to_usd': 0.0041 / 0.869565, 'to_eur': 0.0041},
+        'USD': {'to_usd': 1.0,                'to_eur': 0.869565},
+    }
+
     for (fy, ccy), grp in df.groupby(['fiscal_year', 'currency']):
         rates = get_budget_rates(int(fy))
-        r     = rates.get(ccy, rates.get('USD', {'to_usd': 1.0, 'to_eur': 0.869565}))
+        r     = rates.get(ccy) or HARDCODED.get(ccy) or \
+                {'to_usd': 1.0, 'to_eur': 0.869565}
         mask  = (df['fiscal_year'] == fy) & (df['currency'] == ccy)
         df.loc[mask, 'amount_usd'] = df.loc[mask, 'amount_lc'] * r['to_usd']
         df.loc[mask, 'amount_eur'] = df.loc[mask, 'amount_lc'] * r['to_eur']

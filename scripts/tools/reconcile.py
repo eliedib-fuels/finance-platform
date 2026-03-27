@@ -11,6 +11,7 @@ Usage:
 """
 
 import pandas as pd
+import re
 import sys
 import argparse
 from pathlib import Path
@@ -54,16 +55,19 @@ SHEET_MAP = {v: k for k, v in SHEETS.items()}
 
 def get_out_of_scope_bus(file_path: str,
                           fiscal_year: int = 2026,
-                          fiscal_period: int = 2) -> set:
+                          fiscal_period: int = 2,
+                          ad50_line: str = None) -> set:
     """
-    Discover BUs that have GL data but SAC = 0 across ALL AD50 lines.
-    These are out of scope for the reconciliation.
-    Rule: if SAC=0 AND GL>0 for a BU → exclude from GL entirely.
-    If both SAC=0 AND GL=0 → BU stays (no activity, still in scope).
+    Dynamic per-period out-of-scope detection.
+    Rule: if a BU appears ANYWHERE in SAC for this period
+    (any line, any non-zero amount) → include in GL for ALL lines.
+    If never in SAC → exclude from GL entirely.
+    Recharge BUs naturally handled: they appear in SAC (line 10)
+    so they stay in scope for all lines.
     """
     from scripts.db import query
 
-    # Get all BUs with GL P&L activity in Trade & OCM
+    # Get all Trade & OCM BUs with GL P&L activity
     trade_bus = query("""
         SELECT DISTINCT g.bu_code
         FROM gl_transactions g
@@ -80,78 +84,156 @@ def get_out_of_scope_bus(file_path: str,
 
     gl_bus = set(trade_bus['bu_code'].tolist())
 
-    # Get all BUs with SAC activity across all lines
+    # Get ALL BUs with ANY non-zero SAC amount across ALL lines
     sac_bus = set()
-    for sheet, ad50 in SHEETS.items():
-        df = pd.read_excel(file_path, sheet_name=sheet, header=None)
-        df.columns = ['account_raw','org_raw','period_raw','amount_raw']
-        df['amount'] = pd.to_numeric(df['amount_raw'], errors='coerce')
-        df = df[df['amount'].notna() & (df['amount'] != 0)].copy()
-        df['org_str'] = df['org_raw'].astype(str).str.strip()
-        df['bu_raw']  = df['org_str'].str.split(' ').str[0]
-        df['suffix']  = df['bu_raw'].str[-1]
-        df['bu_code'] = df['bu_raw'].str[:-1]
-        df['entity']  = df['bu_code'].str[:4]
+    for line in SHEETS.values():
+        try:
+            df = get_sac_data(file_path, line,
+                              fiscal_year, fiscal_period)
+            if not df.empty:
+                active = df[df['amount_usd'].abs() > 0][
+                    'bu_code'].unique()
+                sac_bus.update(active)
+        except Exception:
+            continue
 
-        # Only valid entity+suffix combos
-        def is_valid(row):
-            cfg = ENTITY_CONFIG.get(row['entity'])
-            return cfg is not None and row['suffix'] == cfg[0]
-
-        df = df[df.apply(is_valid, axis=1)]
-        sac_bus.update(df['bu_code'].unique())
-
-    # Out of scope = in GL but NOT in SAC (with non-zero amounts)
+    # Out of scope = in GL but NEVER in SAC for this period
     out_of_scope = gl_bus - sac_bus
 
+    print(f"  GL BUs:          {len(gl_bus)}")
+    print(f"  SAC BUs:         {len(sac_bus)}")
+    print(f"  Out of scope:    {len(out_of_scope)} excluded")
     if out_of_scope:
-        print(f"\n  Out-of-scope BUs (GL>0, SAC=0) — excluded:")
         for bu in sorted(out_of_scope):
             print(f"    {bu}")
 
     return out_of_scope
 
-def get_sac_data(file_path: str, ad50_line: str) -> pd.DataFrame:
-    """Get SAC amounts from detail file for one AD50 line."""
+def get_sac_data(file_path: str, ad50_line: str,
+                 fiscal_year: int = 2026,
+                 fiscal_period: int = 2) -> pd.DataFrame:
+    """Handles both single-period (4 col) and multi-period SAC files."""
     sheet = SHEET_MAP.get(ad50_line)
     if not sheet:
         return pd.DataFrame()
+    df_raw = pd.read_excel(file_path, sheet_name=sheet, header=None)
 
-    df = pd.read_excel(file_path, sheet_name=sheet, header=None)
-    df.columns = ['account_raw', 'org_raw', 'period_raw', 'amount_raw']
-    df['amount'] = pd.to_numeric(df['amount_raw'], errors='coerce')
+    def to_s(v):
+        try:
+            f = float(v)
+            return str(int(f)) if f == int(f) else str(v).strip()
+        except Exception:
+            return str(v).strip()
+
+    is_multi = False
+    for i, row in df_raw.head(8).iterrows():
+        vals = [to_s(v) for v in row.values]
+        if len([v for v in vals if re.match(r'^20\d{4}$', v)]) >= 3:
+            is_multi = True
+            break
+
+    if is_multi:
+        return _get_sac_multi(df_raw, fiscal_year, fiscal_period)
+    else:
+        return _get_sac_single(df_raw)
+
+
+def _get_sac_single(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = range(len(df.columns))
+    df['amount'] = pd.to_numeric(df[3], errors='coerce')
     df = df[df['amount'].notna()].copy()
-    df['account_raw'] = df['account_raw'].ffill()
-
-    df['org_str'] = df['org_raw'].astype(str).str.strip()
-    df['bu_raw']  = df['org_str'].str.split(' ').str[0]
-    df['suffix']  = df['bu_raw'].str[-1]
-    df['bu_code'] = df['bu_raw'].str[:-1]
-    df['entity']  = df['bu_code'].str[:4]
-
-    def parse_acct(raw):
-        raw = str(raw).strip()
-        if '.PROD.' in raw or '.NPBO.' in raw:
-            return raw.split('.')[0]
-        return raw.split(' ')[0][:6]
-
-    df['account_code'] = df['account_raw'].apply(parse_acct)
-
-    # Filter valid entities + correct suffix
+    df[0] = df[0].ffill()
+    df['org_str']  = df[1].astype(str).str.strip()
+    df['bu_raw']   = df['org_str'].str.split(' ').str[0]
+    df['suffix']   = df['bu_raw'].str[-1]
+    df['bu_code']  = df['bu_raw'].str[:-1]
+    df['entity']   = df['bu_code'].str[:4]
+    df['account_code'] = df[0].apply(
+        lambda r: str(r).strip().split('.')[0].split(' ')[0][:6])
     def is_valid(row):
         cfg = ENTITY_CONFIG.get(row['entity'])
         return cfg is not None and row['suffix'] == cfg[0]
-
     df = df[df.apply(is_valid, axis=1)].copy()
-
-    # Convert to USD
     df['amount_usd'] = df.apply(
-        lambda r: r['amount'] * ENTITY_CONFIG.get(r['entity'], ('C','USD',1.0))[2],
-        axis=1
-    )
+        lambda r: r['amount'] * ENTITY_CONFIG.get(
+            r['entity'], ('C', 'USD', 1.0))[2], axis=1)
+    return df[['bu_code','entity','account_code',
+               'amount','amount_usd']].copy()
 
-    return df[['bu_code', 'entity', 'account_code',
-               'amount', 'amount_usd']].copy()
+
+def _get_sac_multi(df_raw: pd.DataFrame,
+                   fiscal_year: int,
+                   fiscal_period: int) -> pd.DataFrame:
+    def to_s(v):
+        try:
+            f = float(v)
+            return str(int(f)) if f == int(f) else str(v).strip()
+        except Exception:
+            return str(v).strip()
+
+    target = fiscal_year * 100 + fiscal_period
+    period_row = account_row = target_col = None
+
+    for i, row in df_raw.iterrows():
+        vals = [to_s(v) for v in row.values]
+        numeric = [v for v in vals if re.match(r'^20\d{4}$', v)]
+        if len(numeric) >= 3:
+            period_row = i
+            for j, val in enumerate(row.values):
+                if to_s(val) == str(target):
+                    target_col = j
+            continue
+        if 'Account' in vals and 'Organisation' in vals:
+            account_row = i
+            break
+
+    if period_row is None or account_row is None or target_col is None:
+        return pd.DataFrame()
+
+    header   = [str(v).strip() for v in df_raw.iloc[account_row].values]
+    acct_col = header.index('Account')
+    org_col  = header.index('Organisation')
+
+    data = df_raw.iloc[account_row + 1:].reset_index(drop=True)
+    data[acct_col] = data[acct_col].where(
+        data[acct_col].astype(str).str.strip().str.match(r'^\d'),
+        other=None).ffill()
+
+    rows = []
+    for _, row in data.iterrows():
+        org_val = str(row.iloc[org_col]).strip()
+        m = re.match(r'^(\d{7}[CS])', org_val)
+        if not m:
+            continue
+        bu_raw  = m.group(1)
+        suffix  = bu_raw[-1]
+        bu_code = bu_raw[:-1]
+        entity  = bu_code[:4]
+        cfg     = ENTITY_CONFIG.get(entity)
+        if not cfg or suffix != cfg[0]:
+            continue
+        acct_raw = str(row.iloc[acct_col]).strip()
+        if acct_raw in ('nan', '', 'None'):
+            continue
+        if '.PROD.' in acct_raw or '.NPBO.' in acct_raw:
+            account_code = acct_raw.split('.')[0]
+        else:
+            account_code = acct_raw.split(' ')[0][:6]
+        try:
+            amount_lc = float(row.iloc[target_col])
+        except Exception:
+            amount_lc = 0.0
+        if amount_lc == 0.0:
+            continue
+        rows.append({
+            'bu_code':      bu_code,
+            'entity':       entity,
+            'account_code': account_code,
+            'amount':       amount_lc,
+            'amount_usd':   amount_lc * cfg[2],
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 _out_of_scope_cache = {}
 
@@ -277,13 +359,12 @@ def reconcile_line(file_path: str, ad50_line: str,
               f"— {fiscal_year}/{fiscal_period:02d}")
         print(f"{'='*65}")
 
-    # Get out-of-scope BUs (discovered dynamically)
-    out_of_scope = get_out_of_scope_bus(
+    out_of_scope = out_of_scope or get_out_of_scope_bus(
         file_path, fiscal_year, fiscal_period
     )
 
     # Get SAC data
-    sac = get_sac_data(file_path, ad50_line)
+    sac = get_sac_data(file_path, ad50_line, fiscal_year, fiscal_period)
     if sac.empty:
         if verbose:
             print("  No SAC data found")
@@ -402,11 +483,11 @@ def reconcile_all(file_path: str,
     summary_rows = []
 
     # Discover out-of-scope BUs once for all lines
-    print("\nDiscovering out-of-scope BUs...")
+    print("\nDiscovering out-of-scope BUs for this period...")
     out_of_scope = get_out_of_scope_bus(
         file_path, fiscal_year, fiscal_period
     )
-    print(f"  {len(out_of_scope)} BUs excluded from GL\n")
+    print()
 
     for ad50_line in ['01','02','04','05','07','08','09','10']:
         result = reconcile_line(
