@@ -47,7 +47,8 @@ def to_period_str(v) -> str:
 
 
 def parse_tab(df_raw: pd.DataFrame, tab_name: str,
-              target_periods: list = None) -> pd.DataFrame:
+              target_periods: list = None,
+              plan_type: str = 'ACTUAL') -> pd.DataFrame:
 
     rows       = []
     period_cols = {}
@@ -122,7 +123,7 @@ def parse_tab(df_raw: pd.DataFrame, tab_name: str,
                 'fiscal_year':   fiscal_year,
                 'fiscal_period': fiscal_period,
                 'amount_usd':    amount,
-                'plan_type':     'ACTUAL',
+                'plan_type':     plan_type,
             })
 
     return pd.DataFrame(rows)
@@ -130,7 +131,8 @@ def parse_tab(df_raw: pd.DataFrame, tab_name: str,
 
 def load_official_ad50(file_path: str,
                        target_periods: list = None,
-                       dry_run: bool = False) -> dict:
+                       dry_run: bool = False,
+                       plan_type: str = 'ACTUAL') -> dict:
     """Load official AD50 file into official_ad50 table."""
     from scripts.db import get_conn
 
@@ -152,7 +154,8 @@ def load_official_ad50(file_path: str,
         df_raw = pd.read_excel(file_path, sheet_name=sheet,
                                header=None)
         df = parse_tab(df_raw, tab_name=sheet,
-                       target_periods=target_periods)
+                       target_periods=target_periods,
+                       plan_type=plan_type)
         if df.empty:
             print(f"  {sheet:<15} 0 rows")
             continue
@@ -199,7 +202,8 @@ def load_official_ad50(file_path: str,
             cur = conn.execute("""
                 DELETE FROM official_ad50
                 WHERE fiscal_year=? AND fiscal_period=?
-            """, (int(row.fiscal_year), int(row.fiscal_period)))
+                AND plan_type=?
+            """, (int(row.fiscal_year), int(row.fiscal_period), plan_type))
             deleted += cur.rowcount
 
         print(f"\nDeleted {deleted:,} existing rows")
@@ -231,6 +235,9 @@ if __name__ == '__main__':
     parser.add_argument('--year', type=int, default=None,
                         help='Load all periods for one year')
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--plan-type', default='ACTUAL',
+                        choices=['ACTUAL','BUDGET','FORECAST'],
+                        help='Plan type (default: ACTUAL)')
     args = parser.parse_args()
 
     target = None
@@ -244,4 +251,5 @@ if __name__ == '__main__':
         sys.exit(1)
 
     load_official_ad50(args.file, target_periods=target,
-                       dry_run=args.dry_run)
+                       dry_run=args.dry_run,
+                       plan_type=args.plan_type)

@@ -59,11 +59,22 @@ BUDGET_RATES_FALLBACK = {
            'USD': 0.869565, 'EUR': 1.0},
 }
 
-# Entity suffix rules
+# Entity suffix rules (kept for backwards compat)
 ENTITY_SUFFIX = {
     '0577': 'C', '1033': 'C', '0879': 'C', '0865': 'C',
     '0568': 'S', '0569': 'S', '0682': 'S', '0684': 'S',
     '0755': 'C',
+}
+
+# ENTITY_CONFIG: entity → expected C/S suffix
+ENTITY_CONFIG = ENTITY_SUFFIX
+
+# CCY_BY_ENTITY: entity → local currency
+CCY_BY_ENTITY = {
+    '0577': 'USD', '0569': 'USD', '0682': 'USD', '0684': 'USD',
+    '1033': 'CAD', '0879': 'CAD', '0865': 'CAD',
+    '0568': 'MXN',
+    '0755': 'GYD',
 }
 
 # Currency prefix → currency code
@@ -144,7 +155,8 @@ def get_budget_rates(fiscal_year: int) -> dict:
 
 def parse_sheet(file_path: str, sheet: str,
                 ad50_line: str,
-                target_periods: list = None) -> pd.DataFrame:
+                target_periods: list = None,
+                plan_type: str = 'ACTUAL') -> pd.DataFrame:
     """
     Parse one sheet from multi-period SAC file.
     Returns long-format DataFrame with one row per BU/period.
@@ -222,24 +234,34 @@ def parse_sheet(file_path: str, sheet: str,
         if org_val in ('nan', '', 'None'):
             continue
 
-        # Match standard 7-digit BUs AND alphanumeric lease BUs
-        # e.g. 0577009C, 0577OPTC, 0577H61C, 0577BEAC
-        bu_match = re.match(r'^(\d{4}[A-Z0-9]{3}[CS])', org_val)
+        # Standard BU: 0577009C, 1033094C, 0577OPTC etc.
+        # Budget BU:   GUBTRLAE577BU, GUPASTXE577BU etc.
+        bu_match = (
+            re.match(r'^(0\d{3}[A-Z0-9]{3}[CS])', org_val) or
+            re.match(r'^([A-Z]{2,}[A-Z0-9]+(?:577|568|569|682|684|755|1033)[A-Z0-9]*BU)', org_val)
+        )
         if not bu_match:
             continue
 
-        bu_raw  = bu_match.group(1)
-        suffix  = bu_raw[-1]
-        bu_code = bu_raw[:-1]
-        entity  = bu_code[:4]
+        bu_raw = bu_match.group(1)
 
-        if bu_code[:4] == '1033':
-            log.info(f"DEBUG 1033: bu_raw={bu_raw} suffix={suffix} entity={entity} cfg={ENTITY_SUFFIX.get(entity)}")
-
-        # Check valid suffix for entity
-        expected_suffix = ENTITY_SUFFIX.get(entity)
-        if expected_suffix and suffix != expected_suffix:
-            continue
+        # Detect format
+        if bu_raw.endswith('BU'):
+            # Budget format: GUBTRLAE577BU
+            ent_match = re.search(r'(577|1033|568|569|682|684|755)', bu_raw)
+            if not ent_match:
+                continue
+            entity  = ent_match.group(1).zfill(4)
+            bu_code = bu_raw   # keep full code
+            suffix  = 'C'      # budget BUs are always C scope
+        else:
+            # Standard format: 0577009C
+            suffix  = bu_raw[-1]
+            bu_code = bu_raw[:-1]
+            entity  = bu_code[:4]
+            cfg     = ENTITY_CONFIG.get(entity)
+            if not cfg or suffix != cfg[0]:
+                continue
 
         # Parse account
         acct_raw = str(row.iloc[acct_col]).strip()
@@ -259,16 +281,10 @@ def parse_sheet(file_path: str, sheet: str,
             if amount_lc == 0.0:
                 continue
 
-            # Detect currency from amount string
+            # Currency: detect from amount prefix, fall back to entity
             ccy = get_currency_from_amount(amount_raw)
             if ccy is None:
-                # Infer from entity
-                ccy_map = {
-                    '0577': 'USD', '1033': 'CAD', '0879': 'CAD',
-                    '0865': 'CAD', '0568': 'MXN', '0569': 'USD',
-                    '0682': 'USD', '0684': 'USD', '0755': 'GYD',
-                }
-                ccy = ccy_map.get(entity, 'USD')
+                ccy = CCY_BY_ENTITY.get(entity, 'USD')
 
             fiscal_year   = int(str(yyyymm)[:4])
             fiscal_period = int(str(yyyymm)[4:])
@@ -284,7 +300,7 @@ def parse_sheet(file_path: str, sheet: str,
                 'fiscal_period': fiscal_period,
                 'amount_lc':     amount_lc,
                 'currency':      ccy,
-                'plan_type':     'ACTUAL',
+                'plan_type':     plan_type,
                 'source':        'SAC_MULTI',
             })
 
@@ -316,7 +332,8 @@ def apply_fx(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_sac_multi(file_path: str,
                    target_periods: list = None,
-                   dry_run: bool = False) -> dict:
+                   dry_run: bool = False,
+                   plan_type: str = 'ACTUAL') -> dict:
     """
     Load multi-period SAC file into sac_detail table.
 
@@ -324,6 +341,7 @@ def load_sac_multi(file_path: str,
         file_path:      Path to SAC Excel file
         target_periods: List of YYYYMM to load (None = all)
         dry_run:        Parse only, no DB write
+        plan_type:      ACTUAL, BUDGET, or FORECAST
     """
     from scripts.db import get_conn
 
@@ -341,7 +359,8 @@ def load_sac_multi(file_path: str,
     for sheet, ad50 in SHEETS.items():
         print(f"  Parsing {ad50} {sheet}...", end='')
         try:
-            df = parse_sheet(file_path, sheet, ad50, target_periods)
+            df = parse_sheet(file_path, sheet, ad50, target_periods,
+                             plan_type=plan_type)
             if df.empty:
                 print(f" 0 rows")
                 continue
@@ -390,7 +409,8 @@ def load_sac_multi(file_path: str,
                 DELETE FROM sac_detail
                 WHERE fiscal_year  = ?
                   AND fiscal_period = ?
-            """, (int(row.fiscal_year), int(row.fiscal_period)))
+                  AND plan_type    = ?
+            """, (int(row.fiscal_year), int(row.fiscal_period), plan_type))
             deleted += cur.rowcount
 
         print(f"\nDeleted {deleted:,} existing rows")
@@ -427,6 +447,9 @@ if __name__ == '__main__':
     parser.add_argument('--year', type=int, default=None,
                         help='Load all periods for a specific year')
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--plan-type', default='ACTUAL',
+                        choices=['ACTUAL','BUDGET','FORECAST'],
+                        help='Plan type (default: ACTUAL)')
     args = parser.parse_args()
 
     # Build target periods list
@@ -441,4 +464,5 @@ if __name__ == '__main__':
         sys.exit(1)
 
     load_sac_multi(args.file, target_periods=target,
-                   dry_run=args.dry_run)
+                   dry_run=args.dry_run,
+                   plan_type=args.plan_type)
